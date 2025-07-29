@@ -3,6 +3,8 @@ import numpy as np
 import einops
 import torch
 import cv2
+from PIL import Image
+import timm #DINOV2를 위한 timm 라이브러리 import
 from pathlib import Path
 from types import SimpleNamespace
 import logging
@@ -46,6 +48,26 @@ class YAOFTrackerSingleControl():
         self.lost = False
         self.N_lost = 0
 
+
+        # Re-detection용 추가 사항
+        self._dino = timm.create_model('vit_large_patch14_dinov2.lvd142m',pretrained=True, num_classes=0).eval().to(self.device) 
+        data_config = timm.data.resolve_model_data_config(self._dino)
+        self._dino_tf = timm.data.create_transform(**data_config, is_training=False)
+        self.saved_frame_idx   = []# index(프레임 넘버)
+        self.saved_H_cur2init  = []# global_H_success 호모그래피
+        self.saved_dino_feats  = []# global_H_success dinov2 feature
+        
+    def extract_dino(self, img: np.ndarray) -> np.ndarray:
+        x = self._dino_tf(Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))) .unsqueeze(0).to(self.device, torch.float32)
+
+        with torch.no_grad():
+            z = self._dino.forward_features(x)           
+            z = z.mean(dim=1) if z.dim() == 3 else z     
+            z = torch.nn.functional.normalize(z, dim=-1) 
+
+        return z.squeeze(0).cpu().numpy()               
+
+
     def set_fast_meta(self, meta):
         self.fast_forward = True
         self.fast_forward_H2init = meta.estim_H_current2template
@@ -75,8 +97,16 @@ class YAOFTrackerSingleControl():
             return H_cur2init, meta
         # }}}
 
-        if self.C.no_prewarp_after_N and self.N_lost > self.C.no_prewarp_after_N:
-            self.last_good_H2init = np.eye(3)
+        if self.C.no_prewarp_after_N and self.N_lost > self.C.no_prewarp_after_N: #Re-detection
+            current_feature = self.extract_dino(input_img)
+            if self.saved_dino_feats:
+                features = np.stack(self.saved_dino_feats)                 
+                cosine_similarity  = features @ current_feature                             
+                best  = int(cosine_similarity.argmax())
+                self.last_good_H2init = self.saved_H_cur2init[best].copy()
+            else:
+                self.last_good_H2init = np.eye(3)
+
 
         meta.last_good_H2init = self.last_good_H2init.copy()
 
@@ -163,11 +193,14 @@ class YAOFTrackerSingleControl():
                                                    post_hoc_weights if post_hoc_weights is not None else weights)
         logger.debug(f"global_check_timer(): {global_check_timer()}ms")
         logger.debug(f"global_H_success: {global_H_success}")
-
-        if global_H_success:
+    
+        if global_H_success: #global_H_success조건에 따라 저장
             H_cur2init = H_global_cur2init
             self.lost = False
             self.N_lost = 0
+            self.saved_frame_idx.append(img_identifier)    
+            self.saved_H_cur2init.append(H_cur2init.copy())
+            self.saved_dino_feats.append(self.extract_dino(input_img))
         else:
             self.lost = True
             self.N_lost += 1
